@@ -1,85 +1,105 @@
 # SPDX-FileCopyrightText: © 2026 Max Gabriel Susman
 # SPDX-License-Identifier: Apache-2.0
 #
-# A.0 stub test: SPI words in, the same words back two words later.
-#
-# The bus is driven the way argus_rhd_spi_master drives it on the Arty: SCLK
-# idles low, 48 ns period (24 low, 24 high), MOSI changes while SCLK is low,
-# MISO is sampled on the rising edge. clk is SCLK, so it only toggles during
-# a word, exactly as on the real bus.
+# argus_rhd against the RHD2132 contract (argus_rhd2132_model.vhd in
+# argus-neural-codec). Step A.1 covers every result that needs no stored
+# state; A.2 adds the register file, CONVERT of amplifier channels and the
+# CALIBRATE countdown.
 
 import cocotb
-from cocotb.triggers import Timer
 
-HALF_NS = 24      # SCLK half period: 48 ns, the Arty master at /6
-CS_GAP_NS = 160   # CS high between words, as on the Arty
-
-CS_N = 0          # ui_in bit
-MOSI = 1          # ui_in bit
+import rhd
 
 
-def set_ui(dut, cs_n, mosi):
-    dut.ui_in.value = (mosi << MOSI) | (cs_n << CS_N)
-
-
-async def spi_word(dut, word):
-    """Send one 16-bit word MSB first; return the 16 bits read back."""
-    set_ui(dut, 0, (word >> 15) & 1)       # CS falls, bit 15 on MOSI
-    await Timer(HALF_NS, unit="ns")         # tCS1
-    got = 0
-    for i in range(15, -1, -1):
-        set_ui(dut, 0, (word >> i) & 1)
-        await Timer(HALF_NS, unit="ns")     # SCLK low phase
-        got = (got << 1) | (int(dut.uo_out.value) & 1)   # sample MISO
-        dut.clk.value = 1                   # rising: the chip samples MOSI
-        await Timer(HALF_NS, unit="ns")     # SCLK high phase
-        dut.clk.value = 0                   # falling: the chip moves MISO
-    await Timer(HALF_NS, unit="ns")         # tCS2
-    set_ui(dut, 1, 0)                       # CS rises
-    await Timer(CS_GAP_NS, unit="ns")
-    return got
+def check(cmds, got, want):
+    for c, g, w in zip(cmds, got, want):
+        assert g == w, f"command {c:04x}: got {g:04x}, expected {w:04x}"
 
 
 @cocotb.test()
-async def test_echo_pipeline(dut):
-    dut.ena.value = 1
-    dut.uio_in.value = 0
-    dut.clk.value = 0
-    set_ui(dut, 1, 0)
-    dut.rst_n.value = 0
-    await Timer(200, unit="ns")
-    dut.rst_n.value = 1
-    await Timer(200, unit="ns")
+async def test_reset_words(dut):
+    """The first two words after reset read back as zero: the pipeline."""
+    await rhd.reset(dut)
+    first = [await rhd.word(dut, rhd.CLEAR) for _ in range(3)]
+    assert first[:2] == [0, 0], f"reset words {first[:2]}"
+    assert first[2] == rhd.IDLE, f"third word {first[2]:04x}, the first CLEAR's result"
 
-    sent = [0xA55A, 0x0F0F, 0x8001, 0x7FFE, 0x1234, 0xFFFF, 0x0000, 0xC3C3]
-    got = []
-    for w in sent:
-        got.append(await spi_word(dut, w))
-        dut._log.info(f"sent {w:04x}, got {got[-1]:04x}")
 
-    # Two-word pipeline: the first two reads are the reset value, then each
-    # word comes back two windows after it was sent.
-    assert got[:2] == [0, 0], f"reset words {got[:2]}"
-    for n in range(2, len(sent)):
-        assert got[n] == sent[n - 2], \
-            f"window {n}: got {got[n]:04x}, expected {sent[n - 2]:04x}"
+@cocotb.test()
+async def test_write_ack(dut):
+    """WRITE returns 0xFF and the data, to any address, RAM or not."""
+    await rhd.reset(dut)
+    cmds = [rhd.write(0, 0xDE), rhd.write(4, 0x80), rhd.write(17, 0x00),
+            rhd.write(18, 0x5A), rhd.write(40, 0xFF), rhd.write(63, 0x01)]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, [rhd.write_ack(c & 0xFF) for c in cmds])
+
+
+@cocotb.test()
+async def test_rom(dut):
+    """READ of the ROM: "INTAN", die revision 1, unipolar, 32 amps, ID 1."""
+    await rhd.reset(dut)
+    rom = {40: ord("I"), 41: ord("N"), 42: ord("T"), 43: ord("A"), 44: ord("N"),
+           60: 1, 61: 1, 62: 32, 63: 1}
+    cmds = [rhd.read(a) for a in rom]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, list(rom.values()))
+    dut._log.info("ROM 40-44: " + "".join(chr(g) for g in got[:5]))
+
+
+@cocotb.test()
+async def test_unmapped_reads(dut):
+    """Addresses between the RAM and the ROM read zero."""
+    await rhd.reset(dut)
+    addrs = [18, 25, 39, 45, 50, 59]
+    cmds = [rhd.read(a) for a in addrs]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, [0] * len(addrs))
+
+
+@cocotb.test()
+async def test_aux_channels(dut):
+    """CONVERT of channels 32 to 62 returns the aux marker 0xA000 | c."""
+    await rhd.reset(dut)
+    chans = [32, 33, 34, 48, 49, 62]
+    cmds = [rhd.convert(c) for c in chans]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, [rhd.aux_marker(c) for c in chans])
+
+
+@cocotb.test()
+async def test_aux_commands_idle(dut):
+    """CLEAR and the other aux commands return the idle result.
+
+    CALIBRATE is left for A.2: its result is idle too, but it also starts
+    the countdown that swallows the next nine commands.
+    """
+    await rhd.reset(dut)
+    cmds = [rhd.CLEAR, 0x4000, 0x7FFF, 0x6A00]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, [rhd.IDLE] * len(cmds))
+
+
+@cocotb.test()
+async def test_pipeline_interleaved(dut):
+    """Mixed commands back to back: each result lands two words later."""
+    await rhd.reset(dut)
+    cmds = [rhd.read(40), rhd.write(3, 0x33), rhd.convert(40), rhd.CLEAR,
+            rhd.read(62), rhd.write(9, 0x99), rhd.read(44)]
+    want = [ord("I"), rhd.write_ack(0x33), rhd.aux_marker(40), rhd.IDLE,
+            32, rhd.write_ack(0x99), ord("N")]
+    got = await rhd.results(dut, cmds)
+    check(cmds, got, want)
 
 
 @cocotb.test()
 async def test_cs_echo_and_retire_toggle(dut):
-    dut.ena.value = 1
-    dut.uio_in.value = 0
-    dut.clk.value = 0
-    set_ui(dut, 1, 0)
-    dut.rst_n.value = 0
-    await Timer(200, unit="ns")
-    dut.rst_n.value = 1
-    await Timer(200, unit="ns")
-
-    assert (int(dut.uo_out.value) >> 1) & 1 == 1, "CS_n echo should be high"
-    toggle = (int(dut.uo_out.value) >> 2) & 1
+    """uo_out[1] follows CS_n; uo_out[2] toggles once per word."""
+    await rhd.reset(dut)
+    assert rhd.uo_bit(dut, rhd.CS_ECHO) == 1, "CS_n echo should be high"
+    toggle = rhd.uo_bit(dut, rhd.RETIRED)
     for _ in range(3):
-        await spi_word(dut, 0x5555)
-        now = (int(dut.uo_out.value) >> 2) & 1
+        await rhd.word(dut, rhd.CLEAR)
+        now = rhd.uo_bit(dut, rhd.RETIRED)
         assert now != toggle, "retire output did not toggle"
         toggle = now
