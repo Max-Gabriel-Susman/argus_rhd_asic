@@ -11,11 +11,18 @@
  * (tt.clock_project_stop()) so the line is free.
  *
  * Pins:
- *   ui_in[0]  CS_n          uo_out[0]  MISO
- *   ui_in[1]  MOSI          uo_out[1]  CS_n echo
- *                           uo_out[2]  toggles on every retired command
- *   clk       SCLK          uo_out[7:3] 0
- *   rst_n     reset         uio        unused, inputs
+ *   ui_in[0]    CS_n                  uo_out[0]   MISO
+ *   ui_in[1]    MOSI                  uo_out[1]   CS_n echo
+ *   ui_in[3:2]  chip number strap     uo_out[2]   toggles on every retired command
+ *   ui_in[4]    pattern: 0 IDENT,     uo_out[3]   calibrating
+ *               1 RAMP                uo_out[4]   twoscomp (register 4 bit 6)
+ *   ui_in[7:5]  unused, tie low       uo_out[7:5] 0
+ *   clk         SCLK                  uio         unused, inputs
+ *   rst_n       reset
+ *
+ * Strap the chip number to the Argus lane the chip is on (0 for lane 0):
+ * the IDENT pattern carries it in bits 15:14 of every sample, and the
+ * firmware's frame check expects the lane's own number there.
  */
 
 `default_nettype none
@@ -39,6 +46,8 @@ module tt_um_max_gabriel_susman_argus_rhd (
   wire        retire;
   wire [15:0] result;
   wire        retired_toggle;
+  wire        calibrating;
+  wire        twoscomp;
 
   argus_rhd_spi spi (
       .sclk          (clk),
@@ -53,17 +62,21 @@ module tt_um_max_gabriel_susman_argus_rhd (
   );
 
   argus_rhd_core core (
-      .sclk  (clk),
-      .rst_n (rst_n),
-      .cmd   (cmd),
-      .retire(retire),
-      .result(result)
+      .sclk       (clk),
+      .rst_n      (rst_n),
+      .cmd        (cmd),
+      .retire     (retire),
+      .result     (result),
+      .strap_chip (ui_in[3:2]),
+      .strap_ramp (ui_in[4]),
+      .calibrating(calibrating),
+      .twoscomp   (twoscomp)
   );
 
-  assign uo_out  = {5'b00000, retired_toggle, cs_n, miso};
+  assign uo_out  = {3'b000, twoscomp, calibrating, retired_toggle, cs_n, miso};
   assign uio_out = 8'h00;
   assign uio_oe  = 8'h00;
 
-  wire _unused = &{ena, ui_in[7:2], uio_in, 1'b0};
+  wire _unused = &{ena, ui_in[7:5], uio_in, 1'b0};
 
 endmodule

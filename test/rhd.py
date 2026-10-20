@@ -14,11 +14,15 @@ CS_GAP_NS = 160   # CS high between words
 
 CS_N = 0          # ui_in bits
 MOSI = 1
+CHIP = 2          # 3:2, the chip number strap
+RAMP = 4          # the pattern strap: 0 IDENT, 1 RAMP
 
 # uo_out bits
 MISO = 0
 CS_ECHO = 1
 RETIRED = 2
+CALIBRATING = 3
+TWOSCOMP = 4
 
 
 # -- Commands --------------------------------------------------------------
@@ -38,6 +42,22 @@ def read(addr):
 CALIBRATE = 0x5500
 CLEAR = 0x6A00
 
+# The init sequence argus_rhd_spi_master sends after reset, word for word:
+# two dummy reads, the 18 RAM registers, CALIBRATE and nine reads for it to
+# swallow.
+INIT_REGS = [0xDE, 0x42, 0x04, 0x00, 0x80, 0x40, 0x80, 0x00, 0x16,
+             0x80, 0x17, 0x80, 0x2C, 0x86, 0xFF, 0xFF, 0xFF, 0xFF]
+
+
+def init_sequence():
+    return ([read(63), read(63)]
+            + [write(a, d) for a, d in enumerate(INIT_REGS)]
+            + [CALIBRATE] + [read(63)] * 9)
+
+
+# One sweep as the master sends it: the 32 amplifier channels and two aux.
+SWEEP = [convert(c) for c in range(34)]
+
 # -- Results ---------------------------------------------------------------
 
 IDLE = 0x8000     # twoscomp = 0, the reset value
@@ -53,16 +73,21 @@ def aux_marker(ch):
 
 # -- The bus ---------------------------------------------------------------
 
+_straps = 0       # held on ui_in across words; set by reset()
+
+
 def _set_ui(dut, cs_n, mosi):
-    dut.ui_in.value = (mosi << MOSI) | (cs_n << CS_N)
+    dut.ui_in.value = _straps | (mosi << MOSI) | (cs_n << CS_N)
 
 
 def uo_bit(dut, bit):
     return (int(dut.uo_out.value) >> bit) & 1
 
 
-async def reset(dut):
-    """Bus idle, chip in reset for 200 ns, then released."""
+async def reset(dut, chip=0, ramp=False):
+    """Straps set, bus idle, chip in reset for 200 ns, then released."""
+    global _straps
+    _straps = ((chip & 3) << CHIP) | (int(ramp) << RAMP)
     dut.ena.value = 1
     dut.uio_in.value = 0
     dut.clk.value = 0
